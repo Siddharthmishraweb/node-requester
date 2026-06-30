@@ -1,0 +1,59 @@
+{
+  "name": "velora-express",
+  "version": "1.0.0",
+  "description": "Fast, dependency-light Express utilities for security, routing, validation, observability, caching, rate limits, and resilient APIs.",
+  "homepage": "https://github.com/Siddharthmishraweb/velora-express#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Siddharthmishraweb/velora-express.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Siddharthmishraweb/velora-express/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build-cjs.mjs",
+    "test": "node --test",
+    "prepack": "npm run build && npm test"
+  },
+  "keywords": [
+    "express",
+    "middleware",
+    "api",
+    "security",
+    "validation",
+    "rate-limit",
+    "idempotency",
+    "observability",
+    "performance"
+  ],
+  "author": "Siddharth Mishra",
+  "license": "MIT",
+  "peerDependencies": {
+    "express": ">=4.18.0 <6"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": false
+    }
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}
