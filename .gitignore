@@ -1,0 +1,5 @@
+work/
+outputs/
+*.tgz
+node_modules/
+npm-debug.log*

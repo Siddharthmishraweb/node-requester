@@ -4,6 +4,8 @@ Fast, dependency-light Express utilities for production APIs. `velora-express` g
 
 Runtime dependencies: **zero**. Express is a peer dependency.
 
+Version `1.1.0` also includes an AM92-style compatibility layer: `CustomError`, `ResponseBody`, `configureApp`, `configureRouter`, `asyncWrapper`, `httpContext`, `apiLogging`, `extractHeaders`, `routeSanity`, `handleResponse`, `handleError`, `decryptCryptoKey`, `decryptPayload`, and `encryptPayload`.
+
 ## Install
 
 ```bash
@@ -58,6 +60,91 @@ app.listen(3000);
 | Metrics | `metrics` | Emits request timing, status, route, and request id to your sink. |
 | Utilities | `safeJson`, `stableHash`, `constantTimeEqual`, `clientIp` | Production-safe primitives for logs, signatures, and networking. |
 
+## AM92-Style Stable Response Flow
+
+Use this when you want every route to return the same envelope shape:
+
+```js
+import express from 'express';
+import {
+  ResponseBody,
+  CustomError,
+  configureRouter,
+  configureApp
+} from 'velora-express';
+
+const app = express();
+const router = express.Router();
+
+configureRouter(router, {
+  routerName: 'users',
+  enabled: true,
+  disableCrypto: true,
+  routesConfig: {
+    listUsers: {
+      method: 'get',
+      path: '/users',
+      enabled: true,
+      cache: { ttlMs: 10_000 },
+      pipeline: [
+        async (_req, res) => {
+          res.body = new ResponseBody(200, 'Success', [{ id: 1 }]);
+        }
+      ]
+    },
+    createUser: {
+      method: 'post',
+      path: '/users',
+      enabled: true,
+      pipeline: [
+        async (req, res) => {
+          if (!req.body.email) {
+            throw new CustomError(new Error('Email required'), {
+              statusCode: 422,
+              errorCode: 'USER_EMAIL_REQUIRED'
+            });
+          }
+
+          res.body = new ResponseBody(201, 'Created', { id: 1 });
+        }
+      ]
+    }
+  }
+});
+
+configureApp(app, [{ path: '/api', router }]);
+```
+
+All responses keep this structure:
+
+```json
+{
+  "statusCode": 200,
+  "status": "OK",
+  "message": "Success",
+  "data": {},
+  "error": null,
+  "errorCode": null
+}
+```
+
+Errors use the same structure, so clients do not need a separate parser for failures.
+
+## AM92-Compatible Exports
+
+- `ResponseBody`: stable response envelope.
+- `CustomError`: app error wrapper with `statusCode`, `errorCode`, `data`, and original `error`.
+- `configureApp`: installs request context, header extraction, security, logging, default routes, final response handling, and error handling.
+- `configureRouter`: builds routes from config with pre, main, post, crypto, cache, rate-limit, and validation pipelines.
+- `asyncWrapper` / `asyncHandler`: forwards async errors to Express.
+- `httpContext`: request-scoped storage with helpers for request id, session id, client id, and encryption keys.
+- `apiLogging` and `logManager`: structured request/response logging with body redaction and body-log opt out.
+- `extractHeaders`: stores lowercase request headers and generates missing request/session ids.
+- `routeSanity`: marks matched routes so unmatched routes return a stable 404 envelope.
+- `handleResponse`: sends `ResponseBody` or redirects for 3xx bodies.
+- `handleError`: wraps all errors into `CustomError` and returns a stable `ResponseBody`.
+- `decryptCryptoKey`, `decryptPayload`, `encryptPayload`: optional crypto hooks with pluggable crypto providers.
+
 ## Middleware Order
 
 Recommended order:
@@ -104,6 +191,60 @@ app.use('/api', rateLimit({
 ```
 
 For distributed systems, pass a custom store implementing `hit(key)`.
+
+## Route-Level Response Caching
+
+`configureRouter()` supports cache config per route:
+
+```js
+configureRouter(router, {
+  enabled: true,
+  disableCrypto: true,
+  routesConfig: {
+    catalog: {
+      method: 'get',
+      path: '/catalog',
+      enabled: true,
+      cache: {
+        ttlMs: 30_000,
+        key: (req) => `catalog:${req.headers['accept-language'] || 'en'}`
+      },
+      pipeline: [
+        async (_req, res) => {
+          res.body = new ResponseBody(200, 'Success', await loadCatalog());
+        }
+      ]
+    }
+  }
+});
+```
+
+For lower-level Express handlers, use `responseCache()` or `httpCache()`. Both use `LruTtlStore` by default and accept a custom store.
+
+## Optional Payload Crypto
+
+Velora does not force a crypto dependency. You can provide your own provider:
+
+```js
+import { initialize } from 'velora-express';
+
+await initialize({
+  validateClient: async (clientId) => Boolean(clientId),
+  crypto: {
+    async decryptKey(clientId, encryptedKey) {
+      return unwrapClientKey(clientId, encryptedKey);
+    },
+    encryptData(value, key) {
+      return encrypt(value, key);
+    },
+    decryptData(payload, key) {
+      return decrypt(payload, key);
+    }
+  }
+});
+```
+
+If no provider is supplied, `createPayloadCrypto()` gives you a small AES-256-GCM helper suitable for internal services and tests.
 
 ## Idempotency
 
@@ -203,6 +344,8 @@ declare global {
 - Caches use `Map` insertion order for O(1) LRU-style eviction.
 - Request context uses Node's native `AsyncLocalStorage`.
 - Hashing and constant-time comparison use Node core crypto primitives.
+- Logging redacts sensitive keys by default.
+- Route configuration composes only the middleware a route enables.
 
 ## Publishing Checklist
 

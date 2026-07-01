@@ -1,9 +1,16 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
 const context = new AsyncLocalStorage();
 const STATUS_TEXT = {
+  200: 'OK',
+  201: 'Created',
+  202: 'Accepted',
+  204: 'No Content',
+  301: 'Moved Permanently',
+  302: 'Found',
+  304: 'Not Modified',
   400: 'Bad Request',
   401: 'Unauthorized',
   403: 'Forbidden',
@@ -20,15 +27,60 @@ const STATUS_TEXT = {
   503: 'Service Unavailable',
   504: 'Gateway Timeout'
 };
+export const EXPS_CONST = {
+  REQUEST_ID_HEADER_KEY: 'x-req-id',
+  SESSION_ID_HEADER_KEY: 'x-session-id',
+  CLIENT_ID_HEADER_KEY: 'x-api-client-id',
+  ENCRYPTION_KEY_HEADER_KEY: 'x-api-encryption-key',
+  PLAINTEXT_ENCRYPTION_KEY: 'plaintext-api-encryption-key',
+  RESPONSE_COMPLETED_EVENT: 'velora-express-completed'
+};
+
+const SERVICE = `${process.env.npm_package_name || 'velora-express'}@${process.env.npm_package_version || '0.0.0'}`;
+const veloraState = {
+  initialized: false,
+  validateClient: undefined,
+  crypto: undefined,
+  logger: console
+};
+
+export class ResponseBody {
+  constructor(statusCode = 500, message, data, error, errorCode) {
+    this.statusCode = statusCode;
+    this.status = STATUS_TEXT[statusCode] || 'Internal Server Error';
+    this.message = message || (statusCode && this.status) || 'Unhandled Error';
+    this.data = data ?? null;
+    this.error = error ?? null;
+    this.errorCode = error ? (errorCode || 'Velora::GENERIC') : null;
+  }
+}
+
+export class CustomError extends Error {
+  constructor(error, errorMap = {}) {
+    if (error?._isCustomError && !Object.keys(errorMap).length) return error;
+    super(errorMap.message || error?.message || 'Unhandled Error', { cause: error });
+    this.name = 'CustomError';
+    this._isCustomError = true;
+    this.service = SERVICE;
+    this.message = errorMap.message || error?.message || 'Unhandled Error';
+    this.statusCode = errorMap.statusCode || error?.statusCode || error?.status || 500;
+    this.errorCode = errorMap.errorCode || error?.errorCode || error?.code || 'Velora::GENERIC';
+    this.error = error;
+    this.data = errorMap.data || error?.data;
+  }
+}
 
 export class ApiError extends Error {
   constructor(status = 500, message = STATUS_TEXT[status] || 'Error', options = {}) {
     super(message, { cause: options.cause });
     this.name = 'ApiError';
     this.status = status;
+    this.statusCode = status;
     this.code = options.code || `HTTP_${status}`;
+    this.errorCode = this.code;
     this.expose = options.expose ?? status < 500;
     this.detail = options.detail;
+    this.data = options.data;
     this.headers = options.headers || {};
   }
 
@@ -40,6 +92,57 @@ export class ApiError extends Error {
     });
   }
 }
+
+export async function initialize(options = {}) {
+  veloraState.validateClient = typeof options === 'function' ? options : options.validateClient;
+  veloraState.crypto = options.crypto || veloraState.crypto || createPayloadCrypto(options.cryptoSecret);
+  veloraState.logger = options.logger || console;
+  veloraState.initialized = true;
+  veloraState.logger.info?.(`[${SERVICE} VeloraExpress] Initialised`);
+}
+
+export const ExpressUtils = { initialize };
+export const asyncWrapper = asyncHandler;
+
+export const httpContext = {
+  get(key) {
+    if (!key) return getRequestContext();
+    return contextValue(key);
+  },
+  set(key, value) {
+    return contextValue(key, value);
+  },
+  getRequestId() {
+    return contextValue(`headers.${EXPS_CONST.REQUEST_ID_HEADER_KEY}`);
+  },
+  setRequestId(value) {
+    return contextValue(`headers.${EXPS_CONST.REQUEST_ID_HEADER_KEY}`, value);
+  },
+  getSessionId() {
+    return contextValue(`headers.${EXPS_CONST.SESSION_ID_HEADER_KEY}`);
+  },
+  setSessionId(value) {
+    return contextValue(`headers.${EXPS_CONST.SESSION_ID_HEADER_KEY}`, value);
+  },
+  getClientId() {
+    return contextValue(`headers.${EXPS_CONST.CLIENT_ID_HEADER_KEY}`);
+  },
+  setClientId(value) {
+    return contextValue(`headers.${EXPS_CONST.CLIENT_ID_HEADER_KEY}`, value);
+  },
+  getEncryptionKey() {
+    return contextValue(`headers.${EXPS_CONST.ENCRYPTION_KEY_HEADER_KEY}`);
+  },
+  setEncryptionKey(value) {
+    return contextValue(`headers.${EXPS_CONST.ENCRYPTION_KEY_HEADER_KEY}`, value);
+  },
+  getPlaintextEncryptionKey() {
+    return contextValue(EXPS_CONST.PLAINTEXT_ENCRYPTION_KEY);
+  },
+  setPlaintextEncryptionKey(value) {
+    return contextValue(EXPS_CONST.PLAINTEXT_ENCRYPTION_KEY, value);
+  }
+};
 
 export class LruTtlStore {
   constructor(options = {}) {
@@ -467,6 +570,356 @@ export function clientIp(req) {
   const forwarded = req.headers?.['x-forwarded-for'];
   if (forwarded) return String(forwarded).split(',')[0].trim();
   return req.ip || req.socket?.remoteAddress || '';
+}
+
+export function extractHeaders(req, res, next) {
+  const headers = req.headers || {};
+  for (const [header, value] of Object.entries(headers)) {
+    httpContext.set(`headers.${header.toLowerCase()}`, value);
+  }
+  if (!httpContext.getRequestId()) httpContext.setRequestId(randomUUID());
+  if (!httpContext.getSessionId()) httpContext.setSessionId(randomUUID());
+  res.locals ||= {};
+  res.locals.velora = { requestId: httpContext.getRequestId(), sessionId: httpContext.getSessionId() };
+  queueMicrotask(next);
+}
+
+export function routeSanity(req, _res, next) {
+  req.isMatch = true;
+  queueMicrotask(next);
+}
+
+export function logManager(disableBodyLog = false) {
+  return function veloraLogManager(req, _res, next) {
+    req.disableBodyLog = Boolean(disableBodyLog);
+    queueMicrotask(next);
+  };
+}
+
+export function apiLogging(options = {}) {
+  if (typeof options === 'function') {
+    return apiLogging({ sink: options });
+  }
+  const sink = options.sink || ((entry) => {
+    const level = entry.res.statusCode >= 500 ? 'error' : entry.res.statusCode >= 400 ? 'warn' : 'info';
+    (veloraState.logger[level] || veloraState.logger.info || console.log).call(veloraState.logger, entry);
+  });
+  const redact = createRedactor(options.redact || ['authorization', 'cookie', 'password', 'token', 'secret', 'payload']);
+  return function veloraApiLogging(req, res, next) {
+    req.timestamp = Date.now();
+    res.on?.('finish', () => sink(buildLogMeta(req, res, redact)));
+    req.on?.('aborted', () => {
+      req.isAborted = true;
+      sink(buildLogMeta(req, undefined, redact));
+    });
+    queueMicrotask(next);
+  };
+}
+
+export function handleResponse(req, res, next) {
+  setResponseHeaders(res);
+  const body = res.encryptedBody || res.body;
+  if (res.isError || req.isMatch) {
+    sendResponseBody(res, body);
+  } else {
+    const message = `Cannot ${req.method} ${req.originalUrl || req.url}`;
+    sendResponseBody(res, new ResponseBody(404, message));
+  }
+  res.emit?.(EXPS_CONST.RESPONSE_COMPLETED_EVENT);
+}
+
+export function handleError(error, req, res, next) {
+  if (!error) return queueMicrotask(next);
+  if (error instanceof ResponseBody) {
+    res.body = error;
+  } else {
+    const customError = error instanceof CustomError ? error : new CustomError(error);
+    res.body = new ResponseBody(
+      customError.statusCode,
+      customError.message,
+      customError.data,
+      customError.error,
+      customError.errorCode
+    );
+  }
+  res.isError = true;
+  const key = httpContext.getPlaintextEncryptionKey();
+  if (key && veloraState.crypto?.encryptData) {
+    const payload = veloraState.crypto.encryptData(safeJson(res.body), key);
+    res.encryptedBody = new ResponseBody(200, 'Success', { payload });
+  }
+  return handleResponse(req, res, next);
+}
+
+export async function decryptCryptoKey(_req, _res, next) {
+  try {
+    const clientId = httpContext.getClientId();
+    const encryptedKey = httpContext.getEncryptionKey();
+    if (encryptedKey && veloraState.validateClient) await veloraState.validateClient(clientId);
+    const key = encryptedKey && veloraState.crypto?.decryptKey
+      ? await veloraState.crypto.decryptKey(clientId, encryptedKey)
+      : encryptedKey;
+    if (key) httpContext.setPlaintextEncryptionKey(key);
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+export function decryptPayload(req, _res, next) {
+  try {
+    const key = httpContext.getPlaintextEncryptionKey();
+    const payload = req.body?.payload;
+    if (key && payload && veloraState.crypto?.decryptData) {
+      req.body = veloraState.crypto.decryptData(payload, key);
+    } else if (key && !payload) {
+      req.body = {};
+    }
+    queueMicrotask(next);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export function encryptPayload(_req, res, next) {
+  try {
+    const key = httpContext.getPlaintextEncryptionKey();
+    if (key && res.body && veloraState.crypto?.encryptData) {
+      const payload = veloraState.crypto.encryptData(safeJson(res.body), key);
+      res.encryptedBody = new ResponseBody(200, 'Success', { payload });
+    }
+    queueMicrotask(next);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export function configureApp(app, routes = [], options = {}) {
+  if (!app?.use) throw new CustomError(new Error('app / app.use is undefined'), {
+    statusCode: 500,
+    errorCode: 'Velora::APP_CONFIG_FAILED'
+  });
+  app.use(requestContext({ header: EXPS_CONST.REQUEST_ID_HEADER_KEY }));
+  app.use(extractHeaders);
+  if (options.security !== false) app.use(securityHeaders(options.security));
+  if (options.deadline) app.use(deadline(options.deadline));
+  if (options.logging !== false) app.use(apiLogging(options.logging || {}));
+  for (const route of defaultRoutes(options)) {
+    app[route.method](route.path, ...(route.pipeline || []));
+  }
+  for (const route of routes) app.use(route.path, route.router);
+  app.use(handleResponse);
+  app.use(handleError);
+}
+
+export function configureRouter(router, masterConfig = {}, customConfig = {}) {
+  const config = deepMerge(masterConfig, customConfig);
+  const {
+    routesConfig = {},
+    enabled: routerEnabled = false,
+    disableCrypto: routerDisableCrypto = false,
+    disableBodyLog: routerDisableBodyLog = false,
+    preMiddlewares = [],
+    postMiddlewares = []
+  } = config;
+  const disabledRoutes = [];
+  for (const [name, routeConfig] of Object.entries(routesConfig)) {
+    const {
+      method,
+      path,
+      prePipeline = [],
+      pipeline = [],
+      postPipeline = [],
+      enabled = false,
+      disableCrypto = false,
+      disableBodyLog = false,
+      cache,
+      rateLimit: routeRateLimit,
+      validate: validators
+    } = routeConfig || {};
+    if (!method || !path || typeof router[method.toLowerCase()] !== 'function') {
+      veloraState.logger.error?.(`[${SERVICE} VeloraExpress] Unable to configure route: ${name}`);
+      continue;
+    }
+    if (!enabled && !routerEnabled) {
+      disabledRoutes.push(name);
+      continue;
+    }
+    const cryptoPre = disableCrypto || routerDisableCrypto ? [] : [decryptCryptoKey, decryptPayload];
+    const cryptoPost = disableCrypto || routerDisableCrypto ? [] : [encryptPayload];
+    const routeMiddlewares = [
+      routeSanity,
+      logManager(disableBodyLog || routerDisableBodyLog),
+      cache && responseCache(cache),
+      routeRateLimit && rateLimit(routeRateLimit),
+      validators && validateRequest(validators),
+      ...preMiddlewares,
+      ...prePipeline,
+      ...cryptoPre,
+      ...pipeline,
+      ...cryptoPost,
+      ...postPipeline,
+      ...postMiddlewares,
+      handleResponse
+    ].filter(Boolean).map((mw) => mw === handleResponse ? mw : asyncWrapper(mw));
+    router[method.toLowerCase()](path, ...routeMiddlewares);
+  }
+  if (disabledRoutes.length) {
+    veloraState.logger.warn?.(`[${SERVICE} VeloraExpress] Disabled routes: ${disabledRoutes.join(', ')}`);
+  }
+  return router;
+}
+
+export function responseCache(options = {}) {
+  const store = options.store || new LruTtlStore({ max: options.max || 1000, ttlMs: options.ttlMs || 30000 });
+  const key = options.key || ((req) => `${req.method}:${req.originalUrl || req.url}:${stableHash(req.query || {})}`);
+  const methods = new Set(options.methods || ['GET', 'HEAD']);
+  return function veloraResponseCache(req, res, next) {
+    if (!methods.has(req.method)) return next();
+    const cacheKey = key(req);
+    const cached = store.get(cacheKey);
+    if (cached) {
+      res.setHeader?.('x-cache', cached.stale ? 'STALE' : 'HIT');
+      res.body = cached.body;
+      req.isMatch = true;
+      return handleResponse(req, res, next);
+    }
+    const originalJson = res.json?.bind(res);
+    const originalSend = res.send?.bind(res);
+    res.json = (body) => {
+      if (isCacheableStatus(res.statusCode || body?.statusCode || 200)) store.set(cacheKey, { body });
+      return originalJson(body);
+    };
+    res.send = (body) => {
+      if (isCacheableStatus(res.statusCode || 200)) store.set(cacheKey, { body });
+      return originalSend(body);
+    };
+    res.on?.(EXPS_CONST.RESPONSE_COMPLETED_EVENT, () => {
+      if (res.body && isCacheableStatus(res.body.statusCode)) store.set(cacheKey, { body: res.body });
+    });
+    next();
+  };
+}
+
+export const DEFAULT_ROUTES = [
+  { method: 'get', path: '/health', pipeline: [(_req, res, next) => { res.body = new ResponseBody(200, 'Success', { status: 'up' }); next(); }, handleResponse] }
+];
+
+function setResponseHeaders(res) {
+  const requestId = httpContext.getRequestId();
+  const sessionId = httpContext.getSessionId();
+  if (requestId) res.setHeader?.(EXPS_CONST.REQUEST_ID_HEADER_KEY, requestId);
+  if (sessionId) res.setHeader?.(EXPS_CONST.SESSION_ID_HEADER_KEY, sessionId);
+  const exposed = String(res.getHeader?.('Access-Control-Expose-Headers') || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const header of [EXPS_CONST.REQUEST_ID_HEADER_KEY, EXPS_CONST.SESSION_ID_HEADER_KEY]) {
+    if (!exposed.includes(header)) exposed.push(header);
+  }
+  res.setHeader?.('Access-Control-Expose-Headers', exposed.join(','));
+}
+
+function sendResponseBody(res, candidate) {
+  let body = candidate || {};
+  if (!body.statusCode) body = new ResponseBody(500, 'Response Data Not Found!');
+  res.body = body;
+  if ([301, 302, 307, 308].includes(body.statusCode) && body.data && res.redirect) {
+    res.status(body.statusCode).redirect(body.data);
+    return;
+  }
+  res.status?.(body.statusCode);
+  res.json?.(body);
+}
+
+function buildLogMeta(req, res, redact) {
+  const isAborted = req.isAborted === true;
+  const statusCode = isAborted ? 499 : res?.statusCode || 500;
+  const status = isAborted ? 'Request Aborted' : res?.statusMessage || STATUS_TEXT[statusCode] || 'Internal Server Error';
+  const responseTime = req.timestamp ? Date.now() - req.timestamp : -1;
+  const requestUrl = req.originalUrl || req.url;
+  const httpVersion = `${req.httpVersionMajor || 1}.${req.httpVersionMinor || 1}`;
+  return {
+    type: res ? 'REQ_RES_LOG' : 'REQ_LOG',
+    message: `[HTTP/${httpVersion}] ${req.method} ${requestUrl} | ${statusCode} ${status} | ${responseTime}ms`,
+    req: {
+      httpVersion,
+      ipAddress: clientIp(req),
+      url: requestUrl,
+      method: req.method,
+      headers: redact({ ...(req.headers || {}) }),
+      body: req.disableBodyLog ? {} : redact(req.body || {})
+    },
+    res: {
+      statusCode,
+      status,
+      headers: redact(res?.getHeaders?.() || {}),
+      body: req.disableBodyLog ? {} : redact(res?.body || {}),
+      responseMessage: res?.body?.message || '',
+      responseTime
+    },
+    requestId: httpContext.getRequestId(),
+    sessionId: httpContext.getSessionId()
+  };
+}
+
+function createRedactor(keys) {
+  const patterns = keys.map((key) => String(key).toLowerCase());
+  const redactValue = '[Redacted]';
+  return function redact(value) {
+    if (!value || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map(redact);
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+      const shouldRedact = patterns.some((pattern) => key.toLowerCase().includes(pattern));
+      return [key, shouldRedact ? redactValue : redact(item)];
+    }));
+  };
+}
+
+function defaultRoutes(options) {
+  if (options.defaultRoutes === false) return [];
+  return options.defaultRoutes || DEFAULT_ROUTES;
+}
+
+function isCacheableStatus(statusCode) {
+  return statusCode >= 200 && statusCode < 300;
+}
+
+function deepMerge(left = {}, right = {}) {
+  const output = { ...left };
+  for (const [key, value] of Object.entries(right || {})) {
+    output[key] = value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Map)
+      ? deepMerge(output[key], value)
+      : value;
+  }
+  return output;
+}
+
+export function createPayloadCrypto(secret = process.env.VELORA_CRYPTO_SECRET || 'velora-development-secret') {
+  const keyFrom = (value) => createHash('sha256').update(String(value || secret)).digest();
+  return {
+    async decryptKey(_clientId, encryptedKey) {
+      return encryptedKey;
+    },
+    encryptData(value, key = secret) {
+      const iv = randomUUID().replaceAll('-', '').slice(0, 24);
+      const cipher = createCipheriv('aes-256-gcm', keyFrom(key), Buffer.from(iv, 'hex'));
+      const encrypted = Buffer.concat([cipher.update(typeof value === 'string' ? value : safeJson(value), 'utf8'), cipher.final()]);
+      const tag = cipher.getAuthTag();
+      return `${iv}.${tag.toString('base64url')}.${encrypted.toString('base64url')}`;
+    },
+    decryptData(payload, key = secret) {
+      const [iv, tag, encrypted] = String(payload).split('.');
+      const decipher = createDecipheriv('aes-256-gcm', keyFrom(key), Buffer.from(iv, 'hex'));
+      decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+      const text = Buffer.concat([decipher.update(Buffer.from(encrypted, 'base64url')), decipher.final()]).toString('utf8');
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    }
+  };
 }
 
 function routeFactory(router, method) {

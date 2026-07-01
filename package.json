@@ -1,14 +1,14 @@
 {
   "name": "velora-express",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Fast, dependency-light Express utilities for security, routing, validation, observability, caching, rate limits, and resilient APIs.",
-  "homepage": "https://github.com/Siddharthmishraweb/velora-express#readme",
+  "homepage": "https://github.com/Siddharthmishraweb/node-requester#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Siddharthmishraweb/velora-express.git"
+    "url": "git+https://github.com/Siddharthmishraweb/node-requester.git"
   },
   "bugs": {
-    "url": "https://github.com/Siddharthmishraweb/velora-express/issues"
+    "url": "https://github.com/Siddharthmishraweb/node-requester/issues"
   },
   "type": "module",
   "main": "./dist/index.cjs",

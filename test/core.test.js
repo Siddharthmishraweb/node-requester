@@ -2,10 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ApiError,
+  CustomError,
+  EXPS_CONST,
   LruTtlStore,
+  ResponseBody,
   createCircuitBreaker,
   createMemoryRateLimitStore,
+  createPayloadCrypto,
+  extractHeaders,
+  getRequestContext,
+  handleError,
+  httpContext,
   makeProblem,
+  requestContext,
   safeJson,
   validate,
   withTimeout
@@ -75,3 +84,64 @@ test('makeProblem creates RFC 9457 compatible shape', () => {
   assert.equal(problem.title, 'Missing');
   assert.equal(problem.code, 'NOPE');
 });
+
+test('ResponseBody keeps the stable AM92-style envelope', () => {
+  const body = new ResponseBody(201, 'Created', { id: 1 });
+  assert.deepEqual(Object.keys(body), ['statusCode', 'status', 'message', 'data', 'error', 'errorCode']);
+  assert.equal(body.statusCode, 201);
+  assert.equal(body.status, 'Created');
+  assert.deepEqual(body.data, { id: 1 });
+});
+
+test('CustomError wraps unknown errors with velora metadata', () => {
+  const err = new CustomError(new Error('Nope'), { statusCode: 409, errorCode: 'DUPLICATE' });
+  assert.equal(err._isCustomError, true);
+  assert.equal(err.statusCode, 409);
+  assert.equal(err.errorCode, 'DUPLICATE');
+});
+
+test('extractHeaders fills request and session ids in context', async () => {
+  const req = { headers: { [EXPS_CONST.REQUEST_ID_HEADER_KEY]: 'req-1' } };
+  const res = { locals: {} };
+  await new Promise((resolve, reject) => {
+    const mw = requestContext({ header: EXPS_CONST.REQUEST_ID_HEADER_KEY });
+    mw(req, { setHeader() {} }, () => extractHeaders(req, res, (error) => {
+      if (error) return reject(error);
+      try {
+        assert.equal(httpContext.getRequestId(), 'req-1');
+        assert.equal(getRequestContext()?.requestId, 'req-1');
+        assert.ok(httpContext.getSessionId());
+        resolve();
+      } catch (assertionError) {
+        reject(assertionError);
+      }
+    }));
+  });
+});
+
+test('payload crypto encrypts and decrypts JSON safely', () => {
+  const crypto = createPayloadCrypto('secret');
+  const payload = crypto.encryptData({ hello: 'world' }, 'key');
+  assert.deepEqual(crypto.decryptData(payload, 'key'), { hello: 'world' });
+});
+
+test('handleError emits ResponseBody without changing envelope', () => {
+  const req = { headers: {}, method: 'GET', url: '/x' };
+  const res = fakeResponse();
+  handleError(new ApiError(400, 'Bad', { code: 'BAD' }), req, res, () => {});
+  assert.equal(res.sent.statusCode, 400);
+  assert.equal(res.sent.message, 'Bad');
+  assert.equal(res.sent.errorCode, 'BAD');
+});
+
+function fakeResponse() {
+  const headers = {};
+  return {
+    statusCode: 200,
+    setHeader(key, value) { headers[key] = value; },
+    getHeader(key) { return headers[key]; },
+    status(code) { this.statusCode = code; return this; },
+    json(body) { this.sent = body; return this; },
+    emit() {}
+  };
+}
